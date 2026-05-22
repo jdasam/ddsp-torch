@@ -66,6 +66,7 @@ def angular_cumsum(
     # Reshape into chunks: (batch, n_chunks, chunk_size, ...)
     chunks = angular_frequency.reshape(shape[0], n_chunks, chunk_size, *extra_dims)
     phase = torch.cumsum(chunks, dim=2)
+    phase = phase % (2 * math.pi)
 
     # Offset for next chunk = last sample of current chunk, mod 2π
     # Shape: (batch, n_chunks, 1, ...)

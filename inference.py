@@ -21,9 +21,9 @@ def load_checkpoint(path: str, device: torch.device):
         n_noise_bands=cfg["n_noise_bands"],
         sampling_rate=cfg["sampling_rate"],
         block_size=cfg["block_size"],
+        use_angular_cumsum=True,
     ).to(device)
     model.load_state_dict(ckpt["model"])
-    model.use_angular_cumsum = True  # prevent phase drift on long sequences
     model.eval()
     return model, cfg, ckpt["mean_loudness"], ckpt["std_loudness"]
 

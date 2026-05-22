@@ -136,18 +136,27 @@ def test_angular_cumsum_matches_cumsum_for_short_seq():
 
 
 def test_angular_cumsum_reduces_drift_vs_plain():
-    # angular_cumsum should accumulate less float32 phase error than plain cumsum for long sequences
-    sr, f0, n = 16000, 220.0, 100_000
+    # angular_cumsum should reduce float32 phase error vs plain cumsum.
+    # The within-chunk mod keeps magnitudes bounded, improving float32 precision.
+    # Measured with circular (shortest-arc) distance to correctly handle phase wrap.
+    sr, f0, n = 16000, 440.0, 100_000
     omega_f64 = torch.full((1, n, 1), 2 * math.pi * f0 / sr, dtype=torch.float64)
     omega_f32 = omega_f64.float()
     gt = torch.cumsum(omega_f64, dim=1) % (2 * math.pi)
-    plain_phase = torch.cumsum(omega_f32, dim=1) % (2 * math.pi)
-    ac_phase = angular_cumsum(omega_f32)
-    # Measure mean absolute error (drift accumulates gradually)
-    err_plain = (plain_phase - gt.float()).abs()
-    err_ac = (ac_phase - gt.float()).abs()
-    assert err_ac.mean() < err_plain.mean(), (
-        f"Expected angular_cumsum to reduce drift: ac_mean={err_ac.mean():.6f} vs plain_mean={err_plain.mean():.6f}"
+    plain = torch.cumsum(omega_f32, dim=1) % (2 * math.pi)
+    ac = angular_cumsum(omega_f32)
+
+    def circular_mae(a, b):
+        d = (a - b) % (2 * math.pi)
+        d[d > math.pi] -= 2 * math.pi
+        return d.abs().mean()
+
+    err_plain = circular_mae(plain, gt.float())
+    err_ac = circular_mae(ac, gt.float())
+    improvement = err_plain / (err_ac + 1e-10)
+    assert improvement > 2.5, (
+        f"Expected ≥2.5x drift improvement: got {improvement:.2f}x "
+        f"(ac={err_ac:.2e}, plain={err_plain:.2e})"
     )
 
 
