@@ -255,7 +255,7 @@ def upsample_with_windows(signal: torch.Tensor, n_timesteps: int) -> torch.Tenso
 
     hop_size = n_timesteps // n_intervals
     window_length = 2 * hop_size
-    window = torch.hann_window(window_length, device=signal.device, dtype=signal.dtype)
+    window = torch.hann_window(window_length, periodic=True, device=signal.device, dtype=signal.dtype)
 
     # Apply window to each frame: (batch, n_frames+1, channels, window_length)
     x_windowed = signal.unsqueeze(-1) * window  # broadcast (window_length,)

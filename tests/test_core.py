@@ -96,9 +96,9 @@ def test_upsample_with_windows_smooth():
     x = torch.zeros(1, 20, 1)
     x[:, 10:, :] = 1.0
     out = upsample_with_windows(x, 20 * 160)
-    # No sample should jump by more than 0.1 in one step
+    # No sample should jump by more than 0.015 in one step
     diffs = (out[:, 1:, :] - out[:, :-1, :]).abs()
-    assert diffs.max().item() < 0.1
+    assert diffs.max().item() < 0.015
 
 
 def test_filtered_noise_lowpass():
