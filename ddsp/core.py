@@ -74,46 +74,148 @@ def fft_convolve(
     return out[..., out.shape[-1] // 2: out.shape[-1] // 2 + n]
 
 
-def amp_to_impulse_response(
-    magnitudes: torch.Tensor,
-    block_size: int,
+def apply_window_to_impulse_response(
+    ir: torch.Tensor,
+    window_size: int = 0,
 ) -> torch.Tensor:
-    """Convert per-frame filter magnitudes to windowed impulse responses via IFFT.
+    """Apply Hann window to a zero-phase IR and convert to causal form.
+
+    Matches Magenta's apply_window_to_impulse_response (causal=False path).
 
     Args:
-        magnitudes: (batch, n_frames, n_bands) positive values
-        block_size: target IR length in samples
-
+        ir: (batch, n_frames, ir_size) — zero-phase IR from irfft
+        window_size: Hann window length; 0 or > ir_size defaults to ir_size
     Returns:
-        ir: (batch, n_frames, block_size)
+        (batch, n_frames, ir_size) — causal windowed IR
     """
-    # Build Hermitian-symmetric spectrum and invert
-    magnitudes = torch.cat([magnitudes, magnitudes[..., 1:-1].flip(-1)], dim=-1)
-    ir = torch.fft.irfft(magnitudes, n=block_size)
-    # Shift center to causal and apply Hann window
-    ir = torch.roll(ir, ir.shape[-1] // 2, dims=-1)
-    win = torch.hann_window(ir.shape[-1], device=ir.device, dtype=ir.dtype)
-    return ir * win
+    ir_size = ir.shape[-1]
+    if window_size <= 0 or window_size > ir_size:
+        window_size = ir_size
+
+    window = torch.hann_window(window_size, device=ir.device, dtype=ir.dtype)
+
+    padding = ir_size - window_size
+    if padding > 0:
+        half_idx = (window_size + 1) // 2
+        window = torch.cat([
+            window[half_idx:],
+            torch.zeros(padding, device=ir.device, dtype=ir.dtype),
+            window[:half_idx],
+        ])
+    else:
+        window = torch.roll(window, window_size // 2)  # zero-phase form
+
+    ir = window * ir  # broadcasts over (batch, n_frames)
+
+    if padding > 0:
+        first_half_start = (ir_size - (half_idx - 1)) + 1
+        second_half_end = half_idx + 1
+        ir = torch.cat([ir[..., first_half_start:], ir[..., :second_half_end]], dim=-1)
+    else:
+        ir = torch.roll(ir, ir_size // 2, dims=-1)  # fftshift → causal
+
+    return ir
+
+
+def frequency_impulse_response(
+    magnitudes: torch.Tensor,
+    window_size: int = 0,
+) -> torch.Tensor:
+    """Convert one-sided frequency magnitudes to windowed causal IRs.
+
+    Matches Magenta's frequency_impulse_response.
+
+    Args:
+        magnitudes: (batch, n_frames, n_bands) — non-negative one-sided spectrum
+        window_size: Hann window size (0 = full IR size = 2*(n_bands-1))
+    Returns:
+        (batch, n_frames, 2*(n_bands-1)) — causal windowed IR
+    """
+    magnitudes_c = torch.complex(magnitudes, torch.zeros_like(magnitudes))
+    ir = torch.fft.irfft(magnitudes_c)  # (batch, n_frames, 2*(n_bands-1))
+    return apply_window_to_impulse_response(ir, window_size)
+
+
+def fft_convolve_ola(
+    signal: torch.Tensor,
+    ir: torch.Tensor,
+) -> torch.Tensor:
+    """Frame-based FFT convolution with overlap-and-add (Magenta-style).
+
+    Splits signal into non-overlapping frames, convolves each frame with its
+    corresponding IR, then overlap-adds the results. Applies 'same' padding
+    with group-delay compensation so output length == input length.
+
+    Args:
+        signal: (batch, n_samples)
+        ir: (batch, n_frames, ir_size)
+    Returns:
+        (batch, n_samples)
+    """
+    batch, n_samples = signal.shape
+    n_frames, ir_size = ir.shape[1], ir.shape[2]
+
+    frame_size = int(math.ceil(n_samples / n_frames))
+
+    # Pad signal so it divides evenly into n_frames
+    padded_len = n_frames * frame_size
+    signal_padded = nn.functional.pad(signal, (0, padded_len - n_samples))
+
+    # Split into non-overlapping frames: (batch, n_frames, frame_size)
+    audio_frames = signal_padded.reshape(batch, n_frames, frame_size)
+
+    # Next power-of-2 FFT size covering convolved frame length
+    fft_size = 2 ** int(math.ceil(math.log2(frame_size + ir_size - 1)))
+
+    # Per-frame convolution in frequency domain
+    audio_fft = torch.fft.rfft(audio_frames, n=fft_size)
+    ir_fft = torch.fft.rfft(ir, n=fft_size)
+    conv_frames = torch.fft.irfft(audio_fft * ir_fft, n=fft_size)  # (batch, n_frames, fft_size)
+
+    # Overlap-and-add via fold
+    # fold input: (N, kernel_size, L) → output: (N, 1, 1, out_len)
+    ola_len = (n_frames - 1) * frame_size + fft_size
+    conv_t = conv_frames.permute(0, 2, 1)  # (batch, fft_size, n_frames)
+    audio_out = nn.functional.fold(
+        conv_t,
+        output_size=(1, ola_len),
+        kernel_size=(1, fft_size),
+        stride=(1, frame_size),
+    ).squeeze(1).squeeze(1)  # (batch, ola_len)
+
+    # Crop with group-delay compensation for linear-phase windowed FIR
+    # Matches Magenta's crop_and_compensate_delay(padding='same', delay_compensation=-1)
+    delay = (ir_size - 1) // 2 - 1
+    crop = ola_len - n_samples
+    end = crop - delay
+    audio_out = audio_out[:, delay: ola_len - end]
+
+    return audio_out
 
 
 def filtered_noise(
     magnitudes: torch.Tensor,
     block_size: int,
 ) -> torch.Tensor:
-    """Filtered noise synthesizer: shape noise with per-frame spectral envelopes.
+    """Filtered noise synthesizer using time-varying FIR via OLA convolution.
+
+    Matches Magenta's FilteredNoise.get_signal approach: generates a single
+    noise signal and filters it with per-frame IRs using overlap-and-add,
+    avoiding frame-boundary discontinuities.
 
     Args:
-        magnitudes: (batch, n_frames, n_bands) positive filter magnitudes
+        magnitudes: (batch, n_frames, n_bands) — positive filter magnitudes
         block_size: samples per frame
-
     Returns:
         audio: (batch, n_frames * block_size, 1)
     """
     batch, n_frames, _ = magnitudes.shape
-    ir = amp_to_impulse_response(magnitudes, block_size)          # (batch, n_frames, block_size)
-    noise = torch.rand(batch, n_frames, block_size, device=magnitudes.device) * 2 - 1
-    audio = fft_convolve(noise, ir)                               # (batch, n_frames, block_size)
-    return audio.reshape(batch, n_frames * block_size, 1)
+    n_samples = n_frames * block_size
+
+    ir = frequency_impulse_response(magnitudes)  # (batch, n_frames, ir_size)
+    noise = torch.rand(batch, n_samples, device=magnitudes.device, dtype=magnitudes.dtype) * 2 - 1
+    audio = fft_convolve_ola(noise, ir)  # (batch, n_samples)
+    return audio.unsqueeze(-1)
 
 
 def upsample(signal: torch.Tensor, factor: int) -> torch.Tensor:

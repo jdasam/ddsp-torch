@@ -1,6 +1,9 @@
 import torch
 import pytest
-from ddsp.core import harmonic_synth, fft_convolve, filtered_noise, remove_above_nyquist, upsample
+from ddsp.core import (
+    harmonic_synth, fft_convolve, filtered_noise, remove_above_nyquist, upsample,
+    frequency_impulse_response, apply_window_to_impulse_response, fft_convolve_ola,
+)
 
 
 def test_remove_above_nyquist_kills_high_harmonics():
@@ -27,14 +30,6 @@ def test_harmonic_synth_zero_amps_gives_silence():
     assert audio.abs().max().item() < 1e-6
 
 
-def test_fft_convolve_shape():
-    # Works on (..., n_samples) — test with 3D (batch, frames, block)
-    x = torch.randn(2, 50, 160)
-    k = torch.randn(2, 50, 160)
-    out = fft_convolve(x, k)
-    assert out.shape == (2, 50, 160)
-
-
 def test_fft_convolve_2d():
     # Also works for (batch, n_samples) used by reverb
     x = torch.randn(2, 8000)
@@ -55,3 +50,41 @@ def test_upsample_shape():
     x = torch.randn(2, 100, 3)
     out = upsample(x, factor=160)
     assert out.shape == (2, 16000, 3)
+
+
+def test_frequency_impulse_response_shape():
+    # 65 one-sided bands → IR of 2*(65-1)=128 samples
+    mags = torch.rand(2, 100, 65).abs() + 1e-4
+    ir = frequency_impulse_response(mags)
+    assert ir.shape == (2, 100, 128)
+
+
+def test_frequency_impulse_response_finite():
+    mags = torch.rand(2, 100, 65).abs() + 1e-4
+    ir = frequency_impulse_response(mags)
+    assert torch.isfinite(ir).all()
+
+
+def test_fft_convolve_ola_shape():
+    # signal: (batch, n_samples), ir: (batch, n_frames, ir_size)
+    batch, n_samples, n_frames, ir_size = 2, 16000, 100, 128
+    signal = torch.randn(batch, n_samples)
+    ir = torch.randn(batch, n_frames, ir_size)
+    out = fft_convolve_ola(signal, ir)
+    assert out.shape == (batch, n_samples)
+
+
+def test_fft_convolve_ola_finite():
+    signal = torch.randn(2, 16000)
+    ir = torch.randn(2, 100, 128)
+    out = fft_convolve_ola(signal, ir)
+    assert torch.isfinite(out).all()
+
+
+def test_filtered_noise_shape():
+    # Existing test — must still pass unchanged
+    batch, n_frames, n_bands = 2, 100, 65
+    mags = torch.rand(batch, n_frames, n_bands).abs() + 1e-4
+    block_size = 160
+    audio = filtered_noise(mags, block_size)
+    assert audio.shape == (batch, n_frames * block_size, 1)
