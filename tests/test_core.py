@@ -1,9 +1,10 @@
+import math
 import torch
 import pytest
 from ddsp.core import (
     harmonic_synth, fft_convolve, filtered_noise, remove_above_nyquist, upsample,
     frequency_impulse_response, apply_window_to_impulse_response, fft_convolve_ola,
-    upsample_with_windows,
+    upsample_with_windows, angular_cumsum,
 )
 
 
@@ -110,3 +111,25 @@ def test_filtered_noise_lowpass():
     low_energy = spec[:10].mean()
     high_energy = spec[100:].mean()
     assert low_energy > 5 * high_energy, f"Expected low-pass attenuation: low={low_energy:.4f}, high={high_energy:.4f}"
+
+
+def test_angular_cumsum_shape():
+    omega = torch.rand(2, 6400, 10) * 0.01  # (batch, samples, harmonics)
+    phase = angular_cumsum(omega)
+    assert phase.shape == (2, 6400, 10)
+
+
+def test_angular_cumsum_range():
+    # All values must be in [0, 2π]
+    omega = torch.rand(2, 3000, 5) * 0.1
+    phase = angular_cumsum(omega)
+    assert phase.min().item() >= 0.0
+    assert phase.max().item() <= 2 * math.pi + 1e-5
+
+
+def test_angular_cumsum_matches_cumsum_for_short_seq():
+    # For sequences shorter than chunk_size, results should match plain cumsum mod 2π
+    omega = torch.rand(1, 100, 3) * 0.01
+    phase_simple = torch.cumsum(omega, dim=1) % (2 * math.pi)
+    phase_angular = angular_cumsum(omega, chunk_size=1000)
+    assert torch.allclose(phase_simple, phase_angular, atol=1e-5)

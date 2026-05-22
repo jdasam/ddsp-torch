@@ -29,10 +29,66 @@ def remove_above_nyquist(
     return amplitudes * mask
 
 
+def angular_cumsum(
+    angular_frequency: torch.Tensor,
+    chunk_size: int = 1000,
+) -> torch.Tensor:
+    """Chunk-based cumsum with mod 2π to prevent phase accumulation errors.
+
+    Plain cumsum accumulates float32 errors that become audible for sequences
+    longer than ~100k samples. This function splits the sequence into chunks,
+    applies cumsum within each chunk, then adds mod-2π offsets between chunks.
+
+    Matches Magenta's angular_cumsum (chunk_size=1000 default).
+
+    Args:
+        angular_frequency: (batch, n_samples, ...) radians per sample
+        chunk_size: samples per chunk; smaller → less drift, slightly slower
+    Returns:
+        phase: same shape as input, values in [0, 2π]
+    """
+    shape = angular_frequency.shape
+    n_time = shape[1]
+    extra_dims = shape[2:]
+
+    # Pad to multiple of chunk_size
+    remainder = n_time % chunk_size
+    if remainder:
+        pad_len = chunk_size - remainder
+        angular_frequency = nn.functional.pad(
+            angular_frequency.reshape(shape[0], n_time, -1),
+            (0, 0, 0, pad_len),
+        ).reshape(shape[0], n_time + pad_len, *extra_dims)
+
+    n_time_padded = angular_frequency.shape[1]
+    n_chunks = n_time_padded // chunk_size
+
+    # Reshape into chunks: (batch, n_chunks, chunk_size, ...)
+    chunks = angular_frequency.reshape(shape[0], n_chunks, chunk_size, *extra_dims)
+    phase = torch.cumsum(chunks, dim=2)
+
+    # Offset for next chunk = last sample of current chunk, mod 2π
+    # Shape: (batch, n_chunks, 1, ...)
+    offsets = phase[:, :, -1:, ...] % (2 * math.pi)
+    # Prepend zero offset for the first chunk
+    zero = torch.zeros_like(offsets[:, :1, ...])
+    offsets = torch.cat([zero, offsets[:, :-1, ...]], dim=1)
+    # Cumulative offsets between chunks
+    offsets = torch.cumsum(offsets, dim=1) % (2 * math.pi)
+
+    phase = (phase + offsets) % (2 * math.pi)
+    phase = phase.reshape(shape[0], n_time_padded, *extra_dims)
+
+    if remainder:
+        phase = phase[:, :n_time, ...]
+    return phase
+
+
 def harmonic_synth(
     pitch: torch.Tensor,
     amplitudes: torch.Tensor,
     sampling_rate: int,
+    use_angular_cumsum: bool = False,
 ) -> torch.Tensor:
     """Additive harmonic synthesizer using cumulative phase integration.
 
@@ -40,14 +96,18 @@ def harmonic_synth(
         pitch:      (batch, n_samples, 1) f0 in Hz at audio rate
         amplitudes: (batch, n_samples, n_harmonics) per-harmonic amplitudes at audio rate
         sampling_rate: int
-
+        use_angular_cumsum: use chunk-based cumsum to avoid phase drift for
+            long sequences (>100k samples). Recommended for inference.
     Returns:
         audio: (batch, n_samples, 1)
     """
     n_harm = amplitudes.shape[-1]
     idx = torch.arange(1, n_harm + 1, device=pitch.device, dtype=pitch.dtype)
     omega = 2 * math.pi * pitch * idx / sampling_rate   # phase increment per sample
-    phase = torch.cumsum(omega, dim=1)                   # cumulative phase
+    if use_angular_cumsum:
+        phase = angular_cumsum(omega)
+    else:
+        phase = torch.cumsum(omega, dim=1)               # cumulative phase
     audio = (torch.sin(phase) * amplitudes).sum(dim=-1, keepdim=True)
     return audio
 

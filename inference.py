@@ -13,7 +13,7 @@ from ddsp.loudness import extract_loudness
 
 
 def load_checkpoint(path: str, device: torch.device):
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     cfg  = ckpt["config"]
     model = DDSP(
         hidden_size=cfg["hidden_size"],
@@ -23,6 +23,7 @@ def load_checkpoint(path: str, device: torch.device):
         block_size=cfg["block_size"],
     ).to(device)
     model.load_state_dict(ckpt["model"])
+    model.use_angular_cumsum = True  # prevent phase drift on long sequences
     model.eval()
     return model, cfg, ckpt["mean_loudness"], ckpt["std_loudness"]
 

@@ -54,12 +54,14 @@ class Reverb(nn.Module):
 
 class DDSP(nn.Module):
     def __init__(self, hidden_size: int, n_harmonics: int, n_noise_bands: int,
-                 sampling_rate: int, block_size: int):
+                 sampling_rate: int, block_size: int,
+                 use_angular_cumsum: bool = False):
         super().__init__()
         self.register_buffer("sampling_rate", torch.tensor(sampling_rate))
         self.register_buffer("block_size",    torch.tensor(block_size))
         self.n_harmonics   = n_harmonics
         self.n_noise_bands = n_noise_bands
+        self.use_angular_cumsum = use_angular_cumsum
 
         self.pitch_mlp    = mlp(1, hidden_size, 3)
         self.loudness_mlp = mlp(1, hidden_size, 3)
@@ -100,6 +102,7 @@ class DDSP(nn.Module):
             upsample(pitch, bs),
             upsample_with_windows(amplitudes, n_samples),
             sr,
+            use_angular_cumsum=self.use_angular_cumsum,
         )
 
         # Noise branch
