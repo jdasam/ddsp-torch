@@ -107,12 +107,7 @@ def apply_window_to_impulse_response(
 
     ir = window * ir  # broadcasts over (batch, n_frames)
 
-    if padding > 0:
-        first_half_start = (ir_size - (half_idx - 1)) + 1
-        second_half_end = half_idx + 1
-        ir = torch.cat([ir[..., first_half_start:], ir[..., :second_half_end]], dim=-1)
-    else:
-        ir = torch.roll(ir, ir_size // 2, dims=-1)  # fftshift → causal
+    ir = torch.roll(ir, ir_size // 2, dims=-1)  # shift to causal form (center peak at ir_size // 2)
 
     return ir
 

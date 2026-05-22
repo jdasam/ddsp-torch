@@ -38,14 +38,6 @@ def test_fft_convolve_2d():
     assert out.shape == (2, 8000)
 
 
-def test_filtered_noise_shape():
-    batch, n_frames, n_bands = 2, 100, 65
-    mags = torch.rand(batch, n_frames, n_bands).abs() + 1e-4
-    block_size = 160
-    audio = filtered_noise(mags, block_size)
-    assert audio.shape == (batch, n_frames * block_size, 1)
-
-
 def test_upsample_shape():
     x = torch.randn(2, 100, 3)
     out = upsample(x, factor=160)
@@ -88,3 +80,14 @@ def test_filtered_noise_shape():
     block_size = 160
     audio = filtered_noise(mags, block_size)
     assert audio.shape == (batch, n_frames * block_size, 1)
+
+
+def test_filtered_noise_lowpass():
+    torch.manual_seed(0)
+    mags = torch.zeros(1, 50, 65)
+    mags[:, :, :5] = 1.0  # only low bands active
+    audio = filtered_noise(mags, 160).squeeze(-1).squeeze(0)  # (8000,)
+    spec = torch.fft.rfft(audio).abs()
+    low_energy = spec[:10].mean()
+    high_energy = spec[100:].mean()
+    assert low_energy > 5 * high_energy, f"Expected low-pass attenuation: low={low_energy:.4f}, high={high_energy:.4f}"
