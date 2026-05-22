@@ -133,3 +133,35 @@ def test_angular_cumsum_matches_cumsum_for_short_seq():
     phase_simple = torch.cumsum(omega, dim=1) % (2 * math.pi)
     phase_angular = angular_cumsum(omega, chunk_size=1000)
     assert torch.allclose(phase_simple, phase_angular, atol=1e-5)
+
+
+def test_angular_cumsum_reduces_drift_vs_plain():
+    # angular_cumsum should accumulate less float32 phase error than plain cumsum for long sequences
+    sr, f0, n = 16000, 220.0, 100_000
+    omega_f64 = torch.full((1, n, 1), 2 * math.pi * f0 / sr, dtype=torch.float64)
+    omega_f32 = omega_f64.float()
+    gt = torch.cumsum(omega_f64, dim=1) % (2 * math.pi)
+    plain_phase = torch.cumsum(omega_f32, dim=1) % (2 * math.pi)
+    ac_phase = angular_cumsum(omega_f32)
+    # Measure mean absolute error (drift accumulates gradually)
+    err_plain = (plain_phase - gt.float()).abs()
+    err_ac = (ac_phase - gt.float()).abs()
+    assert err_ac.mean() < err_plain.mean(), (
+        f"Expected angular_cumsum to reduce drift: ac_mean={err_ac.mean():.6f} vs plain_mean={err_plain.mean():.6f}"
+    )
+
+
+def test_angular_cumsum_no_boundary_discontinuity():
+    # Phase steps at chunk boundaries should equal ω (no discontinuity)
+    chunk_size = 100
+    n = chunk_size * 5  # exactly 5 chunks
+    omega = torch.rand(1, n, 2) * 0.05 + 0.001  # (batch, samples, harmonics)
+    phase = angular_cumsum(omega, chunk_size=chunk_size)
+    # Step size at any sample = phase[t] - phase[t-1] mod 2π should equal omega[t]
+    # Check specifically at chunk boundaries (samples chunk_size, 2*chunk_size, ...)
+    for boundary in range(chunk_size, n, chunk_size):
+        step = (phase[:, boundary, :] - phase[:, boundary - 1, :]) % (2 * math.pi)
+        expected = omega[:, boundary, :] % (2 * math.pi)
+        assert torch.allclose(step, expected, atol=1e-4), (
+            f"Discontinuity at boundary {boundary}: step={step}, expected={expected}"
+        )
