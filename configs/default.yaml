@@ -1,0 +1,26 @@
+# Audio
+sampling_rate: 16000
+block_size: 160          # samples per frame → frame rate = 100 Hz
+signal_length: 64000     # 4 seconds per training clip
+
+# Model
+hidden_size: 512
+n_harmonics: 100
+n_noise_bands: 65
+
+# Preprocessing
+out_dir: ./preprocessed/
+oneshot: false
+
+# Training
+batch_size: 16
+steps: 50000
+start_lr: 1.0e-3
+stop_lr: 1.0e-4
+decay_over: 40000
+log_every: 500
+preview_every: 5000
+
+# Loss
+scales: [64, 128, 256, 512, 1024, 2048]
+overlap: 0.75
