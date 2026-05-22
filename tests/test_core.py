@@ -3,6 +3,7 @@ import pytest
 from ddsp.core import (
     harmonic_synth, fft_convolve, filtered_noise, remove_above_nyquist, upsample,
     frequency_impulse_response, apply_window_to_impulse_response, fft_convolve_ola,
+    upsample_with_windows,
 )
 
 
@@ -80,6 +81,24 @@ def test_filtered_noise_shape():
     block_size = 160
     audio = filtered_noise(mags, block_size)
     assert audio.shape == (batch, n_frames * block_size, 1)
+
+
+def test_upsample_with_windows_shape():
+    # (batch=2, n_frames=100, channels=10) → (2, 16000, 10)
+    x = torch.randn(2, 100, 10)
+    out = upsample_with_windows(x, 100 * 160)
+    assert out.shape == (2, 16000, 10)
+
+
+def test_upsample_with_windows_smooth():
+    # Step input: all-zero frames then all-one frames.
+    # Window upsampling should produce a smooth ramp — no abrupt jumps
+    x = torch.zeros(1, 20, 1)
+    x[:, 10:, :] = 1.0
+    out = upsample_with_windows(x, 20 * 160)
+    # No sample should jump by more than 0.1 in one step
+    diffs = (out[:, 1:, :] - out[:, :-1, :]).abs()
+    assert diffs.max().item() < 0.1
 
 
 def test_filtered_noise_lowpass():

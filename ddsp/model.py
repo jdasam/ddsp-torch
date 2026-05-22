@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from .core import (
     harmonic_synth, filtered_noise, fft_convolve,
-    remove_above_nyquist, upsample,
+    remove_above_nyquist, upsample, upsample_with_windows,
 )
 
 
@@ -95,7 +95,12 @@ class DDSP(nn.Module):
         amplitudes = h_params[..., 1:]
         amplitudes = remove_above_nyquist(amplitudes, pitch, sr)
         amplitudes = amplitudes / (amplitudes.sum(-1, keepdim=True) + 1e-7) * total_amp
-        harmonic = harmonic_synth(upsample(pitch, bs), upsample(amplitudes, bs), sr)
+        n_samples = pitch.shape[1] * bs
+        harmonic = harmonic_synth(
+            upsample(pitch, bs),
+            upsample_with_windows(amplitudes, n_samples),
+            sr,
+        )
 
         # Noise branch
         n_params = scale_function(self.noise_proj(hidden) - 5)

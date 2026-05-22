@@ -228,3 +228,45 @@ def upsample(signal: torch.Tensor, factor: int) -> torch.Tensor:
         signal, size=signal.shape[-1] * factor, mode='linear', align_corners=False
     )
     return signal.permute(0, 2, 1)
+
+
+def upsample_with_windows(signal: torch.Tensor, n_timesteps: int) -> torch.Tensor:
+    """Upsample using overlapping Hann windows (OLA). Smoother than linear for amplitude envelopes.
+
+    Matches Magenta's upsample_with_windows. n_timesteps must be divisible by
+    the number of input frames (always true when n_timesteps = n_frames * block_size).
+
+    Args:
+        signal: (batch, n_frames, channels)
+        n_timesteps: target length; must satisfy n_timesteps % n_frames == 0
+    Returns:
+        (batch, n_timesteps, channels)
+    """
+    batch, n_frames, channels = signal.shape
+
+    # Add endpoint (repeat last frame) so there are n_frames intervals
+    signal = torch.cat([signal, signal[:, -1:, :]], dim=1)  # (batch, n_frames+1, channels)
+    n_intervals = n_frames
+
+    if n_timesteps % n_intervals != 0:
+        raise ValueError(
+            f'n_timesteps ({n_timesteps}) must be divisible by n_frames ({n_frames})'
+        )
+
+    hop_size = n_timesteps // n_intervals
+    window_length = 2 * hop_size
+    window = torch.hann_window(window_length, device=signal.device, dtype=signal.dtype)
+
+    # Apply window to each frame: (batch, n_frames+1, channels, window_length)
+    x_windowed = signal.unsqueeze(-1) * window  # broadcast (window_length,)
+
+    # OLA into output buffer
+    out_len = n_frames * hop_size + window_length
+    output = signal.new_zeros(batch, out_len, channels)
+    for i in range(n_frames + 1):
+        start = i * hop_size
+        # x_windowed[:, i, :, :] is (batch, channels, window_length)
+        output[:, start:start + window_length, :] += x_windowed[:, i, :, :].permute(0, 2, 1)
+
+    # Trim rise/fall of first and last window to recover exactly n_timesteps
+    return output[:, hop_size:-hop_size, :]
