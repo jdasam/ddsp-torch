@@ -318,16 +318,21 @@ def upsample_with_windows(signal: torch.Tensor, n_timesteps: int) -> torch.Tenso
     window_length = 2 * hop_size
     window = torch.hann_window(window_length, periodic=True, device=signal.device, dtype=signal.dtype)
 
-    # Apply window to each frame: (batch, n_frames+1, channels, window_length)
-    x_windowed = signal.unsqueeze(-1) * window  # broadcast (window_length,)
+    # Apply window: (batch, n_frames+1, channels, window_length)
+    x_windowed = signal.unsqueeze(-1) * window
 
-    # OLA into output buffer
     out_len = n_frames * hop_size + window_length
-    output = signal.new_zeros(batch, out_len, channels)
-    for i in range(n_frames + 1):
-        start = i * hop_size
-        # x_windowed[:, i, :, :] is (batch, channels, window_length)
-        output[:, start:start + window_length, :] += x_windowed[:, i, :, :].permute(0, 2, 1)
 
-    # Trim rise/fall of first and last window to recover exactly n_timesteps
+    # Vectorised OLA via fold instead of a Python loop over frames.
+    # fold input: (N, C*kernel, L)  — here N=batch*channels, kernel=window_length, L=n_frames+1
+    x_fold = x_windowed.permute(0, 2, 3, 1)          # (batch, channels, window_length, n_frames+1)
+    x_fold = x_fold.reshape(batch * channels, window_length, n_frames + 1)
+    output = nn.functional.fold(
+        x_fold,
+        output_size=(1, out_len),
+        kernel_size=(1, window_length),
+        stride=(1, hop_size),
+    )  # (batch*channels, 1, 1, out_len)
+    output = output.reshape(batch, channels, out_len).permute(0, 2, 1)  # (batch, out_len, channels)
+
     return output[:, hop_size:-hop_size, :]
