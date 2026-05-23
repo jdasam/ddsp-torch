@@ -9,7 +9,7 @@ n_harmonics: 100
 n_noise_bands: 65
 
 # Preprocessing
-out_dir: ./preprocessed/
+out_dir: ./preprocessed/train/
 oneshot: false
 
 # Training
