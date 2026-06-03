@@ -4,10 +4,6 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIDENCE_THRESHOLD = 0.5
-# Minimum fraction of voiced frames required to accept an extractor's output.
-# If an extractor passes confidence_threshold for fewer than MIN_VOICED_RATIO
-# frames, we fall through to the next extractor.
-MIN_VOICED_RATIO = 0.2
 
 # Pitch search range (Hz) — covers C2 (~65) up to ~2 kHz, well above violin/flute top.
 FMIN = 50.0
@@ -61,12 +57,13 @@ def extract_pitch(
     block_size: int,
     confidence_threshold: float = DEFAULT_CONFIDENCE_THRESHOLD,
 ) -> np.ndarray:
-    """Extract f0 using torchcrepe -> PYIN fallback chain.
+    """Extract f0 using torchcrepe, falling back to PYIN only on extractor failure.
 
     Frames whose voicing confidence is below `confidence_threshold` are zeroed
-    out (treated as unvoiced). If an extractor's voiced ratio is below
-    MIN_VOICED_RATIO, it is skipped and the next extractor is tried — this
-    guards against extractor-specific calibration issues on certain instruments.
+    out (treated as unvoiced). A low voiced ratio is a property of the audio
+    (silence, polyphony, percussive content) — not an extractor failure — so it
+    does NOT trigger fallback. We only fall back if the extractor itself raises
+    (e.g., missing dependency, runtime error).
 
     Args:
         signal:        (n_samples,) float32 mono audio
@@ -85,21 +82,16 @@ def extract_pitch(
     ]:
         try:
             f0, conf = fn(signal, sampling_rate, block_size)
-            f0 = _trim_or_pad(f0, n_frames)
-            conf = _trim_or_pad(conf, n_frames)
-            voiced_ratio = (conf >= confidence_threshold).mean() if confidence_threshold > 0.0 else 1.0
-            if voiced_ratio < MIN_VOICED_RATIO:
-                logger.warning(
-                    "%s voiced ratio %.1f%% < %.0f%% — falling through to next extractor",
-                    name, voiced_ratio * 100, MIN_VOICED_RATIO * 100,
-                )
-                continue
-            if confidence_threshold > 0.0:
-                f0 = np.where(conf >= confidence_threshold, f0, 0.0).astype(np.float32)
-            logger.info("Pitch extracted with %s (voiced=%.1f%%)", name, voiced_ratio * 100)
-            return f0
         except Exception as exc:
             logger.warning("%s failed (%s), trying next extractor", name, exc)
+            continue
+        f0 = _trim_or_pad(f0, n_frames)
+        conf = _trim_or_pad(conf, n_frames)
+        if confidence_threshold > 0.0:
+            f0 = np.where(conf >= confidence_threshold, f0, 0.0).astype(np.float32)
+        voiced_ratio = (f0 > 0).mean()
+        logger.debug("Pitch extracted with %s (voiced=%.1f%%)", name, voiced_ratio * 100)
+        return f0
 
     logger.error("All extractors failed — returning zeros")
     return np.zeros(n_frames, dtype=np.float32)

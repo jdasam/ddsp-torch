@@ -108,23 +108,39 @@ else:
     print("Go to Runtime → Change runtime type → T4 GPU, then re-run all cells.")
 """),
 
-# ── 3. Drive mount (optional) ──────────────────────────────────────────────
+# ── 3. Drive mount (recommended) ───────────────────────────────────────────
 code("""\
-# @title 3. (Optional) Mount Google Drive for Persistent Storage
-# @markdown Recommended if you might pause and resume training across sessions.
-# @markdown Skip this cell if you plan to complete everything in one session.
-USE_DRIVE = False  # @param {type:"boolean"}
+# @title 3. Mount Google Drive (Recommended)
+# @markdown **Strongly recommended.** Colab sessions often disconnect during long
+# @markdown training runs, and anything stored in the local Colab filesystem is lost.
+# @markdown Mounting Drive makes the following persist across session resets:
+# @markdown - Your uploaded training audio
+# @markdown - Preprocessed pitch & loudness (skip re-extraction on resume)
+# @markdown - Training checkpoints and previews (training resumes from latest checkpoint)
+# @markdown - Timbre transfer output files
+import os
 
-DRIVE_SAVE_DIR = None
+USE_DRIVE = True  # @param {type:"boolean"}
+
 if USE_DRIVE:
     from google.colab import drive
     drive.mount("/content/drive")
-    import os
-    DRIVE_SAVE_DIR = "/content/drive/MyDrive/DDSP_Assignment"
-    os.makedirs(DRIVE_SAVE_DIR, exist_ok=True)
-    print(f"✓ Drive mounted. Checkpoints will save to: {DRIVE_SAVE_DIR}")
+    WORK_DIR = "/content/drive/MyDrive/DDSP_Assignment"
+    os.makedirs(WORK_DIR, exist_ok=True)
+    print(f"✓ Drive mounted. All artifacts will be saved to:")
+    print(f"  {WORK_DIR}")
 else:
-    print("Drive not mounted. Checkpoints will be saved locally (lost on session reset).")
+    WORK_DIR = "."
+    print("⚠ Drive NOT mounted — everything will be lost if the Colab session resets.")
+    print("  Re-run this cell with USE_DRIVE checked to enable persistence.")
+
+# Sub-directories for each kind of artifact
+AUDIO_DIR        = os.path.join(WORK_DIR, "audio")
+PREPROCESS_DIR   = os.path.join(WORK_DIR, "preprocessed", "train")
+RUNS_DIR         = os.path.join(WORK_DIR, "runs")
+OUTPUTS_DIR      = os.path.join(WORK_DIR, "outputs")
+for d in [AUDIO_DIR, PREPROCESS_DIR, RUNS_DIR, OUTPUTS_DIR]:
+    os.makedirs(d, exist_ok=True)
 """),
 
 # ── Audio selection guide ──────────────────────────────────────────────────
@@ -171,22 +187,36 @@ the audio you feed it.
 # ── 4. Upload audio ────────────────────────────────────────────────────────
 code("""\
 # @title 4. Upload Your Training Audio
-# @markdown Upload WAV, MP3, OGG, or FLAC.
-# @markdown If you have multiple files, upload them all — they will be concatenated.
+# @markdown Upload WAV, MP3, OGG, or FLAC. Multiple files will be concatenated.
+# @markdown **If audio is already in your Drive from a previous session, it will
+# @markdown be reused automatically.**
+import os, glob, shutil
 from google.colab import files
-import os
 
-print("Select your training audio file(s):")
-uploaded = files.upload()
-
-TRAINING_FILES = list(uploaded.keys())
-if TRAINING_FILES:
+cached = sorted(glob.glob(os.path.join(AUDIO_DIR, "*")))
+if cached:
+    TRAINING_FILES = cached
     total_mb = sum(os.path.getsize(f) for f in TRAINING_FILES) / 1e6
-    print(f"\\nUploaded {len(TRAINING_FILES)} file(s), {total_mb:.1f} MB total:")
+    print(f"✓ Reusing {len(TRAINING_FILES)} previously saved file(s) ({total_mb:.1f} MB):")
     for f in TRAINING_FILES:
-        print(f"  • {f}  ({os.path.getsize(f) / 1e6:.1f} MB)")
+        print(f"  • {os.path.basename(f)}")
+    print(f"\\nTo upload different audio: delete the existing files and re-run this cell.")
+    print(f"  !rm -rf '{AUDIO_DIR}'/*")
 else:
-    print("No files uploaded.")
+    print("Select your training audio file(s):")
+    uploaded = files.upload()
+    TRAINING_FILES = []
+    for fname in uploaded.keys():
+        dest = os.path.join(AUDIO_DIR, fname)
+        shutil.copy2(fname, dest)
+        TRAINING_FILES.append(dest)
+    if TRAINING_FILES:
+        total_mb = sum(os.path.getsize(f) for f in TRAINING_FILES) / 1e6
+        print(f"\\n✓ Saved {len(TRAINING_FILES)} file(s) to {AUDIO_DIR} ({total_mb:.1f} MB)")
+        for f in TRAINING_FILES:
+            print(f"  • {os.path.basename(f)}")
+    else:
+        print("No files uploaded.")
 """),
 
 # ── 5. Inspect audio ───────────────────────────────────────────────────────
@@ -276,8 +306,9 @@ DDSP does not train on raw audio. The model receives only two extracted signals:
 The next cell uses **torchcrepe** — a GPU-accelerated PyTorch port of CREPE, a neural \
 pitch estimator. CREPE also returns a per-frame **voicing confidence** in `[0, 1]`. \
 Frames whose confidence is below `0.5` are treated as **unvoiced** and set to `f0 = 0`. \
-If torchcrepe fails or returns too few voiced frames (e.g., your audio is outside its \
-training distribution), the code automatically falls back to librosa's PYIN.
+If torchcrepe itself fails to run (e.g., missing dependency), the code falls back to \
+librosa's PYIN. A low voiced ratio is a property of the *audio* (silence, polyphony, \
+percussive content) — it does **not** trigger fallback.
 
 On a T4 GPU this takes well under a minute even for long audio.
 
@@ -293,20 +324,29 @@ code("""\
 # @title 6. Extract Pitch & Loudness
 # @markdown Pitch is estimated by torchcrepe (GPU). Frames with confidence < 0.5 are
 # @markdown treated as unvoiced and set to f0 = 0.
-import sys
+# @markdown If preprocessing was already done in a previous session (saved to Drive),
+# @markdown this step is skipped automatically.
+import sys, os
 sys.path.insert(0, ".")
 import numpy as np
-from ddsp.dataset import preprocess_audio, save_preprocessed
+from ddsp.dataset import preprocess_audio, save_preprocessed, load_preprocessed
 
-PREPROCESS_DIR = "./preprocessed/train"
 BLOCK_SIZE = 160    # hop size → 100 frames per second
 SIGNAL_LEN = 64000  # 4 seconds per training clip
 
-print("Extracting pitch and loudness...")
-signals, pitches, loudnesses = preprocess_audio(audio, SR, BLOCK_SIZE, SIGNAL_LEN)
-save_preprocessed(PREPROCESS_DIR, signals, pitches, loudnesses)
+required = ["signals.npy", "pitchs.npy", "loudness.npy"]
+cached = all(os.path.exists(os.path.join(PREPROCESS_DIR, f)) for f in required)
 
-print(f"\\n✓ {signals.shape[0]} clips saved to {PREPROCESS_DIR}/")
+if cached:
+    signals, pitches, loudnesses = load_preprocessed(PREPROCESS_DIR)
+    print(f"✓ Reusing cached preprocessing in {PREPROCESS_DIR}/")
+    print(f"  {signals.shape[0]} clips loaded.")
+    print(f"\\n  To re-extract from scratch: !rm -rf '{PREPROCESS_DIR}'")
+else:
+    print("Extracting pitch and loudness (this can take a few minutes)...")
+    signals, pitches, loudnesses = preprocess_audio(audio, SR, BLOCK_SIZE, SIGNAL_LEN)
+    save_preprocessed(PREPROCESS_DIR, signals, pitches, loudnesses)
+    print(f"\\n✓ {signals.shape[0]} clips saved to {PREPROCESS_DIR}/")
 print(f"  signals:   {signals.shape}")
 print(f"  pitches:   {pitches.shape}")
 print(f"  loudness:  {loudnesses.shape}")
@@ -316,6 +356,7 @@ print(f"  loudness:  {loudnesses.shape}")
 code("""\
 # @title 7. Visualize Extracted Features
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 import numpy as np
 
 n_show = min(4, signals.shape[0])
@@ -326,18 +367,25 @@ if n_show == 1:
 for i in range(n_show):
     t = np.arange(pitches.shape[1]) / 100.0  # seconds at 100 Hz
 
-    # Pitch: mask zeros so they appear as gaps
+    # Pitch: log Y, per-clip auto-scaled.
+    # NaN out zeros so unvoiced frames appear as gaps (log scale can't show 0).
     p = pitches[i].copy().astype(float)
     p[p == 0] = np.nan
-    axes[i, 0].plot(t, p, lw=0.8, color="steelblue")
-    axes[i, 0].set(title=f"Clip {i + 1}: Pitch (F0)",
-                   ylabel="Hz", xlabel="Time (s)", ylim=(0, 2000))
+    ax_p = axes[i, 0]
+    ax_p.plot(t, p, lw=0.8, color="steelblue")
+    ax_p.set(title=f"Clip {i + 1}: Pitch (F0)",
+             ylabel="Hz (log)", xlabel="Time (s)")
+    ax_p.set_yscale("log")
+    ax_p.yaxis.set_major_formatter(mticker.ScalarFormatter())
+    ax_p.yaxis.set_minor_formatter(mticker.NullFormatter())
 
+    # Loudness: per-clip auto-scaled.
     axes[i, 1].plot(t, loudnesses[i], lw=0.8, color="coral")
     axes[i, 1].set(title=f"Clip {i + 1}: Loudness",
                    ylabel="dB", xlabel="Time (s)")
 
-plt.suptitle("Extracted Features — First Clips", fontsize=13, y=1.01)
+plt.suptitle("Extracted Features — First Clips (after filtering silent ones)",
+             fontsize=13, y=1.01)
 plt.tight_layout()
 plt.show()
 
@@ -391,10 +439,15 @@ of the predicted and target audio, computed at 6 different window sizes simultan
 | 30,000 | ~30 min | Clearly sounds like the instrument |
 | 50,000 | ~50 min | High quality — recommended |
 
-A preview audio file is saved every 5,000 steps so you can hear the model improve.
+A preview audio file is saved every 5,000 steps so you can hear the model improve. \
+At training start a single clip from your data (the one with the most voiced frames) is \
+fixed as the **preview target**; every preview thereafter is the model's reconstruction of \
+that *same* clip, so listening to previews in order gives you a clean apples-to-apples view \
+of training progress. The original target is saved as `preview_target.wav`.
 
-> **Tip:** If your Colab session may time out, mount Google Drive (Cell 3) \
-so the checkpoint survives a session reset.
+> **Session-safe training:** If your Colab session disconnects during training, just \
+re-run the setup cells (1 → 4 → 6 → 8). Training will pick up from the most recent \
+checkpoint on Drive automatically — no need to start over.
 """),
 
 # ── 8. Train ───────────────────────────────────────────────────────────────
@@ -402,7 +455,10 @@ code("""\
 # @title 8. Train Your DDSP Model
 # @markdown Set the number of steps and a name for this run, then run the cell.
 # @markdown ⏱ 50,000 steps takes approximately 50 minutes on a T4 GPU.
-import subprocess, sys, yaml, os
+# @markdown A live progress bar shows the running loss (EMA) and learning rate.
+# @markdown If a checkpoint already exists at this run name, training resumes from it.
+import sys, yaml, os
+sys.path.insert(0, ".")
 
 STEPS    = 50000         # @param {type:"integer"}
 RUN_NAME = "my_instrument"  # @param {type:"string"}
@@ -414,46 +470,53 @@ cfg["out_dir"] = PREPROCESS_DIR
 with open("configs/run.yaml", "w") as f:
     yaml.safe_dump(cfg, f)
 
-run_out = globals().get("DRIVE_SAVE_DIR") or "runs"
-CHECKPOINT_PATH = os.path.join(run_out, RUN_NAME, "checkpoint.pt")
+CHECKPOINT_PATH = os.path.join(RUNS_DIR, RUN_NAME, "checkpoint.pt")
 
-print(f"Training for {STEPS:,} steps")
-print(f"Checkpoint will be saved to: {CHECKPOINT_PATH}")
+if os.path.exists(CHECKPOINT_PATH):
+    print(f"Existing checkpoint detected — training will resume from it:")
+    print(f"  {CHECKPOINT_PATH}")
+    print(f"\\nTo train from scratch: !rm -rf '{os.path.join(RUNS_DIR, RUN_NAME)}'")
+else:
+    print(f"Starting a new training run at: {CHECKPOINT_PATH}")
+print(f"Target: {STEPS:,} total steps")
 print("─" * 60)
 
-result = subprocess.run([
-    sys.executable, "train.py",
-    "--config", "configs/run.yaml",
-    "--name",   RUN_NAME,
-    "--out",    run_out,
-    "--steps",  str(STEPS),
-])
-if result.returncode == 0:
-    print("\\n✓ Training complete!")
-else:
-    print(f"\\n⚠ Training exited with code {result.returncode}")
+from train import train
+train(config_path="configs/run.yaml", name=RUN_NAME, out=RUNS_DIR, steps=STEPS)
+print("\\n✓ Training complete!")
 """),
 
 # ── 9. Training previews ──────────────────────────────────────────────────
 code("""\
 # @title 9. Listen to Training Progress
-# @markdown Preview files are saved every 5,000 steps.
-# @markdown You should hear the model get progressively better.
-import glob, os
+# @markdown At each preview step, the model resynthesizes the **same fixed clip** from
+# @markdown your training data — so the previews are directly comparable across steps.
+# @markdown The "Target" below is the ground-truth audio the model is trying to match.
+import glob, os, re
 from IPython.display import Audio, display
 import soundfile as sf
 
-run_dir = os.path.join(globals().get("DRIVE_SAVE_DIR") or "runs", RUN_NAME)
-previews = sorted(glob.glob(os.path.join(run_dir, "preview_*.wav")))
+run_dir = os.path.join(RUNS_DIR, RUN_NAME)
 
-if not previews:
-    print(f"No preview files found in {run_dir}/")
-    print("Check that training completed and that RUN_NAME matches what you set in Cell 8.")
+# Target reference (ground-truth audio that all previews try to reproduce)
+target_path = os.path.join(run_dir, "preview_target.wav")
+if os.path.exists(target_path):
+    target_audio, target_sr = sf.read(target_path)
+    print(f"🎯 Target (this is what the model is trying to reproduce):")
+    display(Audio(target_audio, rate=target_sr))
+    print()
+
+# Step previews — filter to numbered files only (exclude preview_target.wav)
+all_previews = sorted(glob.glob(os.path.join(run_dir, "preview_*.wav")))
+step_previews = [p for p in all_previews if re.match(r"preview_\\d+\\.wav$", os.path.basename(p))]
+
+if not step_previews:
+    print(f"No step previews found in {run_dir}/")
+    print("Check that training reached at least preview_every steps and RUN_NAME matches.")
 else:
-    print(f"Found {len(previews)} preview(s):\\n")
-    for path in previews:
-        step_str = os.path.basename(path).replace("preview_", "").replace(".wav", "")
-        step = int(step_str)
+    print(f"Found {len(step_previews)} step preview(s):\\n")
+    for path in step_previews:
+        step = int(re.search(r"preview_(\\d+)\\.wav$", path).group(1))
         audio_preview, sr_preview = sf.read(path)
         print(f"▶ Step {step:,}:")
         display(Audio(audio_preview, rate=sr_preview))
@@ -464,10 +527,10 @@ md("""\
 ---
 ### ✏️ Q3 — Training Progress
 
-1. How does the sound change between the earliest and latest preview?
-2. At roughly which step did the model first start to sound recognizable as your instrument?
-3. Did improvement continue steadily, or did it plateau at some point? \
-If it plateaued, at around which step?
+1. Compare the **target** clip to the earliest preview, and then to the latest preview. \
+What is the model failing to reproduce early on, and what does it eventually get right?
+2. At roughly which step does the preview first sound recognizable as your instrument?
+3. Does improvement continue steadily, or does it plateau? If it plateaus, at around which step?
 
 ---
 **Your answer:**
@@ -528,7 +591,7 @@ if not os.path.exists(CHECKPOINT_PATH):
     print(f"⚠  Checkpoint not found at: {CHECKPOINT_PATH}")
     print("Make sure training completed successfully (Cell 8) and RUN_NAME matches.")
 else:
-    OUTPUT_FILE = "output_transfer.wav"
+    OUTPUT_FILE = os.path.join(OUTPUTS_DIR, "output_transfer.wav")
     timbre_transfer(SOURCE_FILE, CHECKPOINT_PATH, OUTPUT_FILE)
 
     src, ssr = sf.read(SOURCE_FILE)
@@ -538,6 +601,7 @@ else:
     display(Audio(src, rate=ssr))
     print("▶ After timbre transfer:")
     display(Audio(out, rate=osr))
+    print(f"\\n💾 Saved to: {OUTPUT_FILE}")
 """),
 
 # ── 12. Download result ───────────────────────────────────────────────────
@@ -593,7 +657,7 @@ LABELS = {
 }
 
 for shift in SHIFTS:
-    out_file = f"output_shift_{shift:+d}.wav"
+    out_file = os.path.join(OUTPUTS_DIR, f"output_shift_{shift:+d}.wav")
     timbre_transfer(SOURCE_FILE, CHECKPOINT_PATH, out_file,
                     pitch_shift_semitones=float(shift))
     audio_s, sr_s = sf.read(out_file)
@@ -659,7 +723,7 @@ src_uploaded = files.upload()
 
 if src_uploaded:
     creative_source = list(src_uploaded.keys())[0]
-    creative_output = f"{EXPERIMENT_NAME}.wav"
+    creative_output = os.path.join(OUTPUTS_DIR, f"{EXPERIMENT_NAME}.wav")
 
     if not os.path.exists(CHECKPOINT_PATH):
         print(f"⚠  Checkpoint not found: {CHECKPOINT_PATH}")
@@ -677,7 +741,7 @@ if src_uploaded:
         display(Audio(src, rate=ssr))
         print("▶ Result:")
         display(Audio(out, rate=osr))
-        files.download(creative_output)
+        print(f"💾 Saved to: {creative_output}")
 """),
 
 # ── Q6 ─────────────────────────────────────────────────────────────────────

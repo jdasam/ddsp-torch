@@ -13,15 +13,22 @@ def preprocess_audio(
     block_size: int,
     signal_length: int,
     oneshot: bool = False,
+    min_voiced_ratio: float = 0.05,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Slice audio into fixed-length clips; extract pitch and loudness per clip.
 
+    Clips whose voiced-frame ratio (pitch > 0) is below `min_voiced_ratio` are
+    dropped — they carry no timbre signal for the harmonic synthesizer to learn
+    and would also bias the loudness statistics. Pass `min_voiced_ratio=0` to
+    keep every clip.
+
     Args:
-        audio:         (n_samples,) float32 mono
-        sampling_rate: Hz
-        block_size:    samples per frame
-        signal_length: samples per training clip
-        oneshot:       if True, use only the first clip
+        audio:            (n_samples,) float32 mono
+        sampling_rate:    Hz
+        block_size:       samples per frame
+        signal_length:    samples per training clip
+        oneshot:          if True, use only the first clip
+        min_voiced_ratio: drop clips below this voiced fraction (default 0.05)
 
     Returns:
         signals:   (n_clips, signal_length) float32
@@ -38,6 +45,18 @@ def preprocess_audio(
     signals = audio[:n_clips * signal_length].reshape(n_clips, signal_length)
     pitches    = np.stack([extract_pitch(signals[i], sampling_rate, block_size)   for i in range(n_clips)])
     loudnesses = np.stack([extract_loudness(signals[i], sampling_rate, block_size) for i in range(n_clips)])
+
+    if min_voiced_ratio > 0.0:
+        voiced_ratio = (pitches > 0).mean(axis=1)
+        keep = voiced_ratio >= min_voiced_ratio
+        n_dropped = int((~keep).sum())
+        if n_dropped:
+            print(f"Dropping {n_dropped} / {n_clips} clip(s) with voiced ratio < "
+                  f"{min_voiced_ratio*100:.0f}% (silent / no pitched content)")
+        signals    = signals[keep]
+        pitches    = pitches[keep]
+        loudnesses = loudnesses[keep]
+
     return signals, pitches, loudnesses
 
 
